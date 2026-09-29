@@ -145,6 +145,74 @@ sh train_eval.sh
 
 You can modify the `MID_RUN_NAME` to change the name of an experiment, which should be consistent with the name in `train_eval.sh` file.
 
+---
+
+## 3DRS-G: explicit geometry supervision (extension)
+
+The released objective is `L_CE + L_align`, where `L_align` is a pointwise cosine
+term against frozen VGGT features. All of the student's geometry therefore comes
+second-hand, which is the ceiling the paper itself names: performance "is
+upper-bounded by the quality of the teacher 3D foundation model".
+
+This extension adds supervision that does not route through the teacher. The
+ScanNet depth maps and poses are already unprojected by the dataloader (for the
+world-position embedding) and were simply never used as a target:
+
+| term | flag | signal |
+|---|---|---|
+| `align` | `--three_d_align_weight` | baseline cosine distillation from VGGT |
+| `relational` | `--three_d_relational_weight` | match the teacher's *pairwise* structure, invariant to a change of basis |
+| `geo_point` / `geo_depth` / `geo_normal` | `--three_d_geo_weight` | regress world XYZ, camera depth and local surface orientation from the visual tokens, supervised by sensor depth |
+| `corr` | `--three_d_corr_weight` | InfoNCE over patches from different frames that share a voxel |
+
+The last one optimises the paper's own 3D-awareness metric directly. All terms
+are masked by depth validity: ScanNet stores 0 where the sensor returned
+nothing, and `unproject` maps those pixels onto the camera centre.
+
+**Defaults reproduce the published objective exactly** (align weight 1, the rest
+0), so an unflagged run is the baseline. To train the extended version:
+
+```bash
+sh scripts/3d/train/train_multi_geo.sh
+```
+
+### Verifying without a GPU
+
+```bash
+python tools/selftest_3d_supervision.py   # 37 checks, CPU-only, no ScanNet needed
+```
+
+Builds a synthetic room with known geometry and checks each loss against ground
+truth (a plane must yield a constant normal, dropout patches must not
+contribute, 3D-aware features must beat 3D-blind ones on the correspondence
+term, defaults must equal the baseline term, gradients must reach every head).
+
+### Measuring the representation, not the loss
+
+The distillation loss value cannot tell "encodes the same geometry in a rotated
+basis" apart from "encodes no geometry". `llava/analysis/feature_gap.py` adds
+CKA and Procrustes (basis-invariant similarity), mutual-kNN agreement, the
+paper's multi-view correspondence score, and a held-out ridge probe from
+features to world coordinates:
+
+```bash
+python tools/measure_3d_gap.py --model-path ckpt/llavanext-qwen-3drs \
+    --num-scenes 50 --layers -1 -3 -5 --output analysis/gap_baseline.json
+```
+
+`probe_r2_backbone` is the load-bearing number: it asks whether geometry is in
+the backbone features or only in the projection head trained to mimic VGGT.
+
+### Notes
+
+- `--torch_compile` is dropped from the extended training script: the
+  correspondence term samples a data-dependent number of anchors each step,
+  which triggers recompilation.
+- Ablate by setting single weights to 0 -- each term is logged separately
+  (`LM Loss: align=... geo_point=... corr=...`).
+
+---
+
 ## Citation
 
 If you find this work useful, please cite:

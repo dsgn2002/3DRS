@@ -71,7 +71,22 @@ def _get_unpad_data(attention_mask):
     )
 
 import torch.distributed as dist
-from deepspeed.comm import get_rank
+try:
+    from deepspeed.comm import get_rank
+except Exception:  # noqa: BLE001 - analysis/inference without the training stack.
+    # Not just ImportError: a deepspeed present but unable to find CUDA_HOME
+    # raises MissingCUDAException from its op builder at import time.
+    def get_rank():
+        return dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
+
+from llava.model.three_d_supervision import (
+    ContrastiveHeads,
+    GeometryHeads,
+    compute_3d_supervision,
+    contrastive_supervision_enabled,
+    geometry_supervision_enabled,
+    supervision_setting,
+)
 
 def gather_loss(loss):
     # 将标量 loss 转为张量（确保设备一致）
@@ -85,6 +100,27 @@ def gather_loss(loss):
     # 转换为数值列表
     gathered_losses = [loss.item() for loss in gathered_losses]
     return gathered_losses
+
+
+def log_3d_losses(losses, prefix="3D"):
+    """Rank-0 print of each 3D-supervision term, averaged over ranks.
+
+    Reported per term rather than as one number: the whole point of adding
+    explicit geometry is being able to see which signal is actually moving.
+    All terms are gathered in one collective -- calling gather_loss per term
+    would put a fresh synchronisation point in every training step per term.
+    """
+    if not losses:
+        return
+    names = list(losses)
+    stacked = torch.stack([losses[n].detach().float().reshape(()) for n in names])
+    if dist.is_available() and dist.is_initialized():
+        stacked = stacked.to(torch.cuda.current_device())
+        buckets = [torch.zeros_like(stacked) for _ in range(dist.get_world_size())]
+        dist.all_gather(buckets, stacked)
+        stacked = torch.stack(buckets).mean(dim=0)
+    if get_rank() == 0:
+        print(f"{prefix} Loss: " + " ".join(f"{n}={v:.4f}" for n, v in zip(names, stacked.tolist())))
 
 # Copied from transformers.models.llama.modeling_llama.LlamaRMSNorm with Llama->Qwen2
 class Qwen2RMSNorm(nn.Module):
@@ -855,6 +891,16 @@ class Qwen2PreTrainedModel(PreTrainedModel):
             module.weight.data.normal_(mean=0.0, std=std)
             if module.padding_idx is not None:
                 module.weight.data[module.padding_idx].zero_()
+        elif isinstance(module, nn.LayerNorm):
+            # Needed for the geometry/contrastive heads, which are absent from
+            # the LLaVA-Video checkpoint. from_pretrained(low_cpu_mem_usage=True)
+            # materialises missing modules from the meta device as empty
+            # tensors and relies on this method to fill them; without this
+            # branch their LayerNorms stayed uninitialised (NaN on this build),
+            # and every loss that touched them was NaN from step 0.
+            module.weight.data.fill_(1.0)
+            if module.bias is not None:
+                module.bias.data.zero_()
 
 
 QWEN2_INPUTS_DOCSTRING = r"""
@@ -950,6 +996,23 @@ class Qwen2Model(Qwen2PreTrainedModel):
             nn.Linear(config.hidden_size, config.hidden_size*2),
             nn.GELU(),
             nn.Linear(config.hidden_size*2, 2048)
+        )
+        # Explicit-geometry decoders (3DRS-G). Only built when enabled so a
+        # baseline run keeps the released checkpoint's parameter set exactly.
+        self.geo_heads = (
+            GeometryHeads(
+                config.hidden_size,
+                use_confidence=supervision_setting(config, "three_d_geo_confidence"),
+            )
+            if geometry_supervision_enabled(config)
+            else None
+        )
+        # Contrastive VLM<->3D alignment heads; same only-when-enabled rule.
+        self.contrast_heads = (
+            ContrastiveHeads(config.hidden_size, teacher_dim=2048,
+                             dim=supervision_setting(config, "three_d_contrast_dim"))
+            if contrastive_supervision_enabled(config)
+            else None
         )
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
         self.layers = nn.ModuleList()
@@ -1217,6 +1280,15 @@ class Qwen2ForCausalLM(Qwen2PreTrainedModel):
         )
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
+        # Contrasting an intermediate decoder layer needs every layer's output.
+        # Under gradient checkpointing those tensors are the checkpoint inputs
+        # already held for recomputation, so keeping references is ~free.
+        need_layers = (
+            labels is not None
+            and contrastive_supervision_enabled(self.config)
+            and supervision_setting(self.config, "three_d_contrast_layer") != -1
+        )
+
         # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
         outputs = self.model(
             input_ids=input_ids,
@@ -1226,37 +1298,41 @@ class Qwen2ForCausalLM(Qwen2PreTrainedModel):
             inputs_embeds=inputs_embeds,
             use_cache=use_cache,
             output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
-            return_dict=return_dict,
+            output_hidden_states=output_hidden_states or need_layers,
+            return_dict=return_dict or need_layers,
             img_pos_list=img_pos_list,
             img_length_list=img_length_list
         )
 
         hidden_states = outputs[0]
-        logits = self.lm_head(hidden_states)
-        logits = logits.float()
+        all_hidden_states = outputs.hidden_states if need_layers else None
 
         loss = None
         if labels is not None:
-            # Shift so that tokens < n predict n
-            shift_logits = logits[..., :-1, :].contiguous()
-            shift_labels = labels[..., 1:].contiguous()
-            # Flatten the tokens
-            loss_fct = CrossEntropyLoss()
-            shift_logits = shift_logits.view(-1, self.config.vocab_size)
-            shift_labels = shift_labels.view(-1)
-            # Enable model parallelism
-            shift_labels = shift_labels.to(shift_logits.device)
-            loss = loss_fct(shift_logits, shift_labels)
+            # Only positions whose next token is supervised need a vocabulary
+            # distribution. With 32 video frames ~6.7k of ~6.8k positions are
+            # image tokens labelled IGNORE_INDEX, and pushing them through the
+            # 152k-way lm_head and then upcasting to fp32 costs ~4GB that the
+            # loss never reads -- enough to OOM LoRA on a 24GB card. The loss is
+            # identical: CrossEntropyLoss already skipped those positions.
+            # Training-time `logits` are therefore (n_supervised, vocab), not
+            # (batch, seq, vocab); generation passes no labels and is unaffected.
+            shift_labels = labels[..., 1:]
+            keep = shift_labels.ne(-100)
+            logits = self.lm_head(hidden_states[..., :-1, :][keep]).float()
+            loss = CrossEntropyLoss()(logits, shift_labels[keep].to(logits.device))
             
             if loss is not None:
-                distill_loss = self.feature_3d_alignment(video_dict, hidden_states, img_pos_list=img_pos_list, img_length_list=img_length_list)
-                loss += distill_loss
-                gathered_distill_loss = gather_loss(distill_loss)
-                if get_rank() == 0:
-                    avg_distill_loss = sum(gathered_distill_loss) / len(gathered_distill_loss)
-                    print(f"Distill Loss: {avg_distill_loss:.4f}")
-           
+                aux_losses = self.three_d_supervision_losses(
+                    video_dict, hidden_states, img_pos_list=img_pos_list,
+                    img_length_list=img_length_list, all_hidden_states=all_hidden_states,
+                )
+                for value in aux_losses.values():
+                    loss = loss + value.to(loss.dtype)
+                log_3d_losses(aux_losses, prefix="LM")
+        else:
+            logits = self.lm_head(hidden_states).float()
+
         if not return_dict:
             output = (logits,) + outputs[1:]
             return (loss,) + output if loss is not None else output
@@ -1268,6 +1344,17 @@ class Qwen2ForCausalLM(Qwen2PreTrainedModel):
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
         )
+
+    def three_d_supervision_losses(self, video_dict, hidden_states, img_pos_list=None,
+                                   img_length_list=None, all_hidden_states=None):
+        """3D-supervision terms for this step, keyed by name.
+
+        With default config this is just the paper's cosine distillation term;
+        the geometry, relational, correspondence and contrastive terms switch on
+        via the ``three_d_*`` settings (see llava/model/three_d_supervision.py).
+        """
+        return compute_3d_supervision(self, video_dict, hidden_states, img_pos_list,
+                                      img_length_list, all_hidden_states)
 
     def prepare_inputs_for_generation(
         self, input_ids, past_key_values=None, attention_mask=None, inputs_embeds=None, **kwargs

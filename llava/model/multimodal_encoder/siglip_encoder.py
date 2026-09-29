@@ -214,6 +214,19 @@ class SigLipAttention(nn.Module):
         key_states = key_states.view(batch_size, q_len, self.num_heads, self.head_dim).transpose(1, 2)
         value_states = value_states.view(batch_size, q_len, self.num_heads, self.head_dim).transpose(1, 2)
 
+        if not output_attentions:
+            # Fused attention: the same computation as the eager path below,
+            # without materialising the (heads x tokens x tokens) matrix and its
+            # fp32 softmax upcast. At 32 frames that transient is ~1GB per call,
+            # which is what OOMed LoRA training on a 24GB card. Callers only read
+            # attention weights when output_attentions=True, which keeps eager.
+            attn_output = nn.functional.scaled_dot_product_attention(
+                query_states, key_states, value_states, attn_mask=attention_mask,
+                dropout_p=self.dropout if self.training else 0.0, scale=self.scale,
+            )
+            attn_output = attn_output.transpose(1, 2).reshape(batch_size, q_len, self.embed_dim)
+            return self.out_proj(attn_output), None
+
         k_v_seq_len = key_states.shape[-2]
         attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) * self.scale
 

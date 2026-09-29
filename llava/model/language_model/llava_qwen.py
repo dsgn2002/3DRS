@@ -28,10 +28,17 @@ from transformers.generation.utils import GenerateOutput
 # from ...constants import IGNORE_INDEX, IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN
 from llava.model.llava_arch import LlavaMetaModel, LlavaMetaForCausalLM
 from transformers import Qwen2Config
-from .qwen2.modeling_qwen2 import Qwen2Model, Qwen2ForCausalLM
+from .qwen2.modeling_qwen2 import Qwen2Model, Qwen2ForCausalLM, log_3d_losses
+from llava.model.three_d_supervision import contrastive_supervision_enabled, supervision_setting
 
 import torch.distributed as dist
-from deepspeed.comm import get_rank
+try:
+    from deepspeed.comm import get_rank
+except Exception:  # noqa: BLE001 - analysis/inference without the training stack.
+    # Not just ImportError: a deepspeed present but unable to find CUDA_HOME
+    # raises MissingCUDAException from its op builder at import time.
+    def get_rank():
+        return dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
 
 def gather_loss(loss):
     # 将标量 loss 转为张量（确保设备一致）
@@ -270,35 +277,17 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
         return inputs
 
     def feature_3d_alignment(self, video_dict, hidden_states, img_pos_list=None, img_length_list=None, margin=0.0):
-        C = hidden_states.shape[-1]
-        feature = hidden_states[:,img_pos_list[0]:img_pos_list[0]+img_length_list[0],:].view(32,14,15,C)[:,:,:-1,:].contiguous().view(32*14*14,C)
-        feature_proj = self.model.proj_3d(feature)
-        feature_3d = video_dict['feature_3d']
-        feature_3d = feature_3d.to(device=feature.device, dtype=feature.dtype)
-        feature_3d = feature_3d.squeeze()
+        """Backwards-compatible scalar view of the 3D supervision.
 
-        S, L, D = feature_3d.shape
-        assert feature_proj.shape[-1] == D and S == 32
-        if L == 768:
-            feature_3d = feature_3d.view(S, 24, 32, D).permute(0, 3, 1, 2).contiguous()
-        elif L == 1036:
-            feature_3d = feature_3d.view(S, 28, 37, D).permute(0, 3, 1, 2).contiguous()
-        elif L == 256:
-            feature_3d = feature_3d.view(S, 16, 16, D).permute(0, 3, 1, 2).contiguous()
-        else:
-            raise NotImplementedError
+        Kept so external scripts that called the original single-term method
+        still work; new code should use ``three_d_supervision_losses`` and log
+        the terms separately.
+        """
+        losses = self.three_d_supervision_losses(
+            video_dict, hidden_states, img_pos_list=img_pos_list, img_length_list=img_length_list
+        )
+        return sum(losses.values())
 
-        feature_3d = F.adaptive_avg_pool2d(feature_3d, (14, 14)).view(S, D, 14, 14)
-        feature_3d = feature_3d.view(S, D, 14*14).permute(0, 2, 1).contiguous().view(S*14*14, D)
-        
-        feature_proj_norm = feature_proj / feature_proj.norm(dim=-1, p=2, keepdim=True)
-        feature_3d_norm = feature_3d / feature_3d.norm(dim=-1, p=2, keepdim=True)
-        
-        feature_sim = ((feature_proj_norm - feature_3d_norm.detach()) ** 2).sum(dim=-1)
-        feature_sim_loss = feature_sim.mean()
-        
-        return feature_sim_loss
-    
     def extract_object_feature(self, video_dict, hidden_states, feature_3d=None, img_pos_list=None, img_length_list=None, box_labels=None):
         object_boxes = video_dict["objects"][0]
         object_boxes_center = object_boxes[:, :3]
@@ -342,60 +331,6 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
 
         return object_features, ground_head_features_3d
     
-    def feature_3d_similarity(self, video_dict, hidden_states, img_pos_list=None, img_length_list=None, tau=0.07):
-        # 1. 从hidden_states提取对应区域，并 reshape 为 (32*14*14, C)
-        C = hidden_states.size(-1)
-        # 假定hidden_states的提取区域可以重构为 (32, 14, 15, C)
-        feature = hidden_states[:, img_pos_list[0]:img_pos_list[0] + img_length_list[0], :].view(32, 14, 15, C)[:, :, :-1, :].contiguous().view(32 * 14 * 14, C)
-        text_feature = hidden_states[:,img_pos_list[0]+img_length_list[0]:,:].view(-1, C).mean(dim=0,keepdim=True)
-        l = text_feature.shape[0]
-
-        # 重构成 (32, 14, 15, C)，然后沿第二维丢弃最后一个token变为 (32, 14, 14, C)
-        feature_norm = feature / feature.norm(dim=-1, p=2, keepdim=True)
-        text_feature_norm = text_feature / text_feature.norm(dim=-1, p=2, keepdim=True)
-        text2vis_sim = F.softmax((feature_norm @ text_feature_norm.T) / tau,dim=0).view(32*14*14, l)
-
-        # 2. 投影hidden_states特征（如果self.model中有3d投影层）
-        feature_proj = self.model.proj_3d(feature)  # shape: (32*14*14, D)
-
-        # 3. 从video_dict中获取3d特征，并调整形状
-        feature_3d = video_dict['feature_3d']
-        feature_3d = feature_3d.to(device=feature_proj.device, dtype=feature_proj.dtype)
-        feature_3d = feature_3d.squeeze()  # 去除多余的维度
-
-        # 假设feature_3d形状为 (S, L, D)
-        S, L, D = feature_3d.shape
-        assert feature_proj.shape[-1] == D and S == 32, "Hidden特征和3D特征维度/样本数不匹配！"
-
-        if L == 768:
-            # 假设重构为 (S, 24, 32, D), 再转为 (S, D, 24, 32)
-            feature_3d = feature_3d.view(S, 24, 32, D).permute(0, 3, 1, 2).contiguous()
-        elif L == 1036:
-            # 假设重构为 (S, 28, 37, D), 再转为 (S, D, 28, 37)
-            feature_3d = feature_3d.view(S, 28, 37, D).permute(0, 3, 1, 2).contiguous()
-        elif L == 256:
-            # 假设重构为 (S, 16, 16, D), 再转为 (S, D, 16, 16)
-            feature_3d = feature_3d.view(S, 16, 16, D).permute(0, 3, 1, 2).contiguous()
-        else:
-            raise NotImplementedError(f"Unsupported feature_3d shape with L={L}")
-
-        # 通过自适应平均池化将空间尺寸调整为 (14, 14)，再 reshape 到 (S*14*14, D)
-        feature_3d = F.adaptive_avg_pool2d(feature_3d, (14, 14)).view(S, D, 14, 14)
-        feature_3d = feature_3d.view(S, D, 14 * 14).permute(0, 2, 1).contiguous().view(S * 14 * 14, D)
-        
-        # 4. 特征归一化后计算余弦相似度矩阵
-        feature_proj_norm = feature_proj / feature_proj.norm(dim=-1, p=2, keepdim=True)
-        feature_3d_norm = feature_3d / feature_3d.norm(dim=-1, p=2, keepdim=True) # (L, D)
-
-        # 计算两个特征矩阵各自两两的余弦相似度，shape均为(32*14*14, 32*14*14)
-        feature_sim = torch.matmul(feature_proj_norm, feature_proj_norm.transpose(0, 1))
-        feature_3d_sim = torch.matmul(feature_3d_norm, feature_3d_norm.transpose(0, 1))
-        
-        # 5. 用均方误差来使hidden_states的相似度矩阵与3d特征的相似度矩阵对齐
-        loss_vis = F.l1_loss(feature_sim, feature_3d_sim.detach())
-
-        return loss_vis
-     
     def predict_box(
         self,
         input_ids: torch.LongTensor = None,
@@ -426,6 +361,13 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
         )
 
         # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
+        # Grounding samples (ScanRefer/Multi3DRefer, ~36% of the mix) take this
+        # path, so an intermediate-layer contrast term needs the layers here too.
+        need_layers = (
+            box_labels is not None
+            and contrastive_supervision_enabled(self.config)
+            and supervision_setting(self.config, "three_d_contrast_layer") != -1
+        )
         outputs = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -434,13 +376,14 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
             inputs_embeds=inputs_embeds,
             use_cache=use_cache,
             output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
-            return_dict=return_dict,
+            output_hidden_states=output_hidden_states or need_layers,
+            return_dict=return_dict or need_layers,
             img_pos_list=img_pos_list,
             img_length_list=img_length_list
         )
 
         hidden_states = outputs[0]
+        all_hidden_states = outputs.hidden_states if need_layers else None
         ground_locations = (labels >= self.config.ground_token_ids[0]) & (labels <= self.config.ground_token_ids[-1])
         ground_hidden = hidden_states[ground_locations].squeeze(1)
         object_features_llm, _ = self.extract_object_feature(video_dict, hidden_states, feature_3d=None, img_pos_list=img_pos_list, img_length_list=img_length_list, box_labels=box_labels) 
@@ -495,12 +438,13 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
                 #     nce_loss /= len(box_labels[0])
                 # loss = bce_loss + nce_loss
             if loss is not None:
-                distill_loss = self.feature_3d_alignment(video_dict, hidden_states, img_pos_list=img_pos_list, img_length_list=img_length_list)
-                loss += distill_loss
-                gathered_distill_loss = gather_loss(distill_loss)
-                if get_rank() == 0:
-                    avg_distill_loss = sum(gathered_distill_loss) / len(gathered_distill_loss)
-                    print(f"Grouding Distill Loss: {avg_distill_loss:.4f}")
+                aux_losses = self.three_d_supervision_losses(
+                    video_dict, hidden_states, img_pos_list=img_pos_list,
+                    img_length_list=img_length_list, all_hidden_states=all_hidden_states,
+                )
+                for value in aux_losses.values():
+                    loss = loss + value.to(loss.dtype)
+                log_3d_losses(aux_losses, prefix="Grounding")
         
         return loss, scores
 

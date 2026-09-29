@@ -27,17 +27,25 @@ from llava.utils import rank0_print
 def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, load_4bit=False, device_map="auto", torch_dtype="float16",attn_implementation="flash_attention_2", customized_config=None, overwrite_config=None, **kwargs):
     kwargs["device_map"] = device_map
 
-    if load_8bit:
-        kwargs["load_in_8bit"] = True
-    elif load_4bit:
-        kwargs["load_in_4bit"] = True
-        kwargs["quantization_config"] = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_compute_dtype=torch.float16, bnb_4bit_use_double_quant=True, bnb_4bit_quant_type="nf4")
-    elif torch_dtype == "float16":
-        kwargs["torch_dtype"] = torch.float16
-    elif torch_dtype == "bfloat16":
-        kwargs["torch_dtype"] = torch.bfloat16
-    else:
-        import pdb;pdb.set_trace()
+    dtype = {"float16": torch.float16, "bfloat16": torch.bfloat16}.get(torch_dtype)
+    if dtype is None:
+        raise ValueError(f"unsupported torch_dtype {torch_dtype!r}; use 'float16' or 'bfloat16'")
+    # Modules that must stay in full precision under 8/4-bit loading: the
+    # multimodal stack, and heads that are randomly initialised when starting
+    # from LLaVA-Video (a frozen 4-bit random matrix can never be trained).
+    skip = ["mm_projector", "vision_tower", "vision_resampler", "lm_head", "ground_head",
+            "proj_3d", "geo_heads", "corres_linear", "linear_dc", "geometric_linear", "contrast_heads"]
+    if load_8bit or load_4bit:
+        # Previously this set load_in_4bit=True *and* quantization_config, which
+        # transformers rejects ("can't pass load_in_4bit ... when passing
+        # quantization_config"), so quantised loading never worked. It also left
+        # torch_dtype unset, loading every unquantised module in fp32.
+        kwargs["quantization_config"] = BitsAndBytesConfig(
+            load_in_8bit=load_8bit, load_in_4bit=load_4bit and not load_8bit,
+            bnb_4bit_compute_dtype=dtype, bnb_4bit_use_double_quant=True,
+            bnb_4bit_quant_type="nf4", llm_int8_skip_modules=skip,
+        )
+    kwargs["torch_dtype"] = dtype
 
     if customized_config is not None:
         kwargs["config"] = customized_config

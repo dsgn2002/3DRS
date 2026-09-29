@@ -128,6 +128,38 @@ class ModelArguments:
     ground_loss_scale: Optional[int] = field(default=1)
     ground_head_temperature: Optional[float] = field(default=0.07)
 
+    # ---- 3D representation supervision (3DRS-G) ---------------------------- #
+    # Defaults reproduce the published 3DRS objective exactly: cosine
+    # distillation from the frozen 3D foundation model and nothing else.
+    three_d_patch_grid: Optional[int] = field(default=14)
+    three_d_align_weight: Optional[float] = field(default=1.0)
+    # Match the teacher's pairwise structure rather than its exact vectors.
+    three_d_relational_weight: Optional[float] = field(default=0.0)
+    # Regress world XYZ / camera depth / surface orientation from the visual
+    # tokens, supervised by ScanNet sensor depth instead of by the teacher.
+    three_d_geo_weight: Optional[float] = field(default=0.0)
+    three_d_geo_normal_weight: Optional[float] = field(default=1.0)
+    three_d_geo_depth_weight: Optional[float] = field(default=1.0)
+    three_d_geo_confidence: Optional[bool] = field(default=False)
+    # InfoNCE over patches from different frames that share a voxel.
+    three_d_corr_weight: Optional[float] = field(default=0.0)
+    three_d_corr_voxel_size: Optional[float] = field(default=0.2)
+    three_d_corr_temperature: Optional[float] = field(default=0.07)
+    three_d_corr_anchors: Optional[int] = field(default=256)
+    # Contrastive VLM <-> VGGT alignment. Positives are every token observing
+    # the same voxel (any frame, either modality); optional hard negatives are
+    # look-alike tokens >= hard_margin metres apart in the same scene.
+    three_d_contrast_weight: Optional[float] = field(default=0.0)
+    three_d_contrast_layer: Optional[int] = field(default=-1)
+    three_d_contrast_dim: Optional[int] = field(default=2048)
+    three_d_contrast_tau: Optional[float] = field(default=0.07)
+    three_d_contrast_xview: Optional[bool] = field(default=True)
+    three_d_contrast_lam_xview: Optional[float] = field(default=1.0)
+    three_d_contrast_hard_weight: Optional[float] = field(default=0.0)
+    three_d_contrast_hard_margin: Optional[float] = field(default=1.0)
+    three_d_contrast_hard_k: Optional[int] = field(default=16)
+    three_d_contrast_max_tokens: Optional[int] = field(default=3136)
+
 
 @dataclass
 class DataArguments:
@@ -264,21 +296,36 @@ def get_mm_adapter_state_maybe_zero_3(named_params, keys_to_match):
 
 
 def find_all_linear_names(model):
-    cls = torch.nn.Linear
-    lora_module_names = set()
-    multimodal_keywords = ["mm_projector", "vision_tower", "vision_resampler"]
-    for name, module in model.named_modules():
-        if any(mm_keyword in name for mm_keyword in multimodal_keywords):
-            continue
-        if isinstance(module, cls) and "ground_head" not in name:
-            names = name.split(".")
-            lora_module_names.add(names[0] if len(names) == 1 else names[-1])
+    """Full dotted paths of the Linear modules LoRA should adapt.
 
-    if "lm_head" in lora_module_names:  # needed for 16-bit
-        lora_module_names.remove("lm_head")
-    
-    rank0_print("lora_module_names", lora_module_names)
-    return list(lora_module_names)
+    Returns paths rather than the bare last name component. PEFT matches a
+    target by suffix, and heads built from nn.Sequential have children named
+    "0"/"2" -- so returning "0" makes PEFT wrap every Linear whose path ends in
+    ".0", including the mm_projector this function means to exclude.
+
+    Also excludes the task and 3D-supervision heads: they are randomly
+    initialised when starting from LLaVA-Video, and a low-rank update on top of
+    a frozen random matrix cannot learn anything useful. They are trained in
+    full instead (see the lora_enable branch in train()).
+    """
+    cls = torch.nn.Linear
+    excluded = [
+        "mm_projector", "vision_tower", "vision_resampler",
+        "ground_head", "proj_3d", "geo_heads", "corres_linear",
+        "linear_dc", "geometric_linear", "contrast_heads",
+    ]
+    lora_module_names = set()
+    for name, module in model.named_modules():
+        if not isinstance(module, cls):
+            continue
+        if any(key in name for key in excluded):
+            continue
+        if name.split(".")[-1] == "lm_head":  # needed for 16-bit
+            continue
+        lora_module_names.add(name)
+
+    rank0_print(f"lora target modules: {len(lora_module_names)} Linear layers")
+    return sorted(lora_module_names)
 
 
 def safe_save_model_for_hf_trainer(trainer: transformers.Trainer, output_dir: str):
@@ -1072,7 +1119,14 @@ class LazySupervisedDataset(Dataset):
                     elif sampling_strategy == "end" and sampling_number is not None:
                         cur_data_dict = cur_data_dict[-sampling_number:]
                     elif sampling_strategy == "random" and sampling_number is not None:
-                        random.shuffle(cur_data_dict)
+                        # Seeded per file. Nothing seeds `random` before the
+                        # dataset is built, and under torchrun every rank builds
+                        # it independently -- so an unseeded shuffle gave each
+                        # GPU, and each run, a different subset. String seeds are
+                        # hashed with SHA-512, so this is stable across processes
+                        # regardless of PYTHONHASHSEED.
+                        subset_seed = os.environ.get("SUBSET_SEED", "0")
+                        random.Random(f"{json_path}:{subset_seed}").shuffle(cur_data_dict)
                         cur_data_dict = cur_data_dict[:sampling_number]
 
                     rank0_print(f"Loaded {len(cur_data_dict)} samples from {json_path}")
@@ -1465,6 +1519,31 @@ def get_model(model_args, training_args, bnb_model_from_pretrained_args):
         overwrite_config["max_xyz_range"] = [15, 15, 5]
 
     
+    for _name in (
+        "three_d_patch_grid",
+        "three_d_align_weight",
+        "three_d_relational_weight",
+        "three_d_geo_weight",
+        "three_d_geo_normal_weight",
+        "three_d_geo_depth_weight",
+        "three_d_geo_confidence",
+        "three_d_corr_weight",
+        "three_d_corr_voxel_size",
+        "three_d_corr_temperature",
+        "three_d_corr_anchors",
+        "three_d_contrast_weight",
+        "three_d_contrast_layer",
+        "three_d_contrast_dim",
+        "three_d_contrast_tau",
+        "three_d_contrast_xview",
+        "three_d_contrast_lam_xview",
+        "three_d_contrast_hard_weight",
+        "three_d_contrast_hard_margin",
+        "three_d_contrast_hard_k",
+        "three_d_contrast_max_tokens",
+    ):
+        overwrite_config[_name] = getattr(model_args, _name)
+
     if model_args.ground_head_type is not None:
         overwrite_config["ground_head_type"] = model_args.ground_head_type
         overwrite_config["ground_head_hidden_size"] = model_args.ground_head_hidden_size
@@ -1606,6 +1685,17 @@ def train(attn_implementation=None):
                     load_in_8bit=training_args.bits == 8,
                     llm_int8_threshold=6.0,
                     llm_int8_has_fp16_weight=False,
+                    # Keep the multimodal stack and every trainable head out of
+                    # quantisation. The grounding and 3D-supervision heads are
+                    # randomly initialised when starting from LLaVA-Video, and a
+                    # frozen 4-bit random matrix cannot be trained into
+                    # anything; quantising the vision tower and projector would
+                    # also degrade the visual features this method supervises.
+                    llm_int8_skip_modules=[
+                        "mm_projector", "vision_tower", "vision_resampler",
+                        "lm_head", "ground_head", "proj_3d", "geo_heads",
+                        "corres_linear", "linear_dc", "geometric_linear", "contrast_heads",
+                    ],
                     bnb_4bit_compute_dtype=compute_dtype,
                     bnb_4bit_use_double_quant=training_args.double_quant,
                     bnb_4bit_quant_type=training_args.quant_type,  # {'fp4', 'nf4'}
@@ -1773,6 +1863,13 @@ def train(attn_implementation=None):
             for name, param in model.named_parameters():
                 if "embed_tokens" in name or "lora_" in name:
                     param.requires_grad_(True)
+            # The 3D-supervision heads are new and randomly initialised, so they
+            # train in full even under LoRA. Setting requires_grad is also what
+            # gets them into the checkpoint: get_peft_state_non_lora_maybe_zero_3
+            # saves exactly the non-LoRA params that require grad.
+            for name, param in model.named_parameters():
+                if any(k in name for k in ("proj_3d", "corres_linear", "geo_heads", "contrast_heads")):
+                    param.requires_grad_(True)
         else:
             if model_args.mm_tunable_parts is None:  # traditional way of deciding which part to train
                 model.config.tune_mm_mlp_adapter = training_args.tune_mm_mlp_adapter = model_args.tune_mm_mlp_adapter
@@ -1832,6 +1929,11 @@ def train(attn_implementation=None):
                 if "world_position_embedding" in name:
                     param.requires_grad_(True)
         
+        if model_args.three_d_geo_weight > 0 or model_args.three_d_contrast_weight > 0:
+            for name, param in model.named_parameters():
+                if "geo_heads" in name or "contrast_heads" in name:
+                    param.requires_grad_(True)
+
         if model_args.ground_head_type is not None:
             if model_args.ground_head_type in ['mlp', 'score', 'infonce']:
                 for name, param in model.named_parameters():
@@ -1843,17 +1945,26 @@ def train(attn_implementation=None):
         from tqdm import tqdm
 
         modifier_rank = 0  # 选择一个进程作为参数修改者
-        for name, param in tqdm(model.named_parameters()):
-            # 使用 GatheredParameters 上下文管理器
+        # Only vision_adapter weights need the rank-0 init + broadcast below, and
+        # those modules are commented out in siglip_encoder.py, so this list is
+        # empty for every current config. The loop used to run one broadcast per
+        # parameter across all ~8B weights: thousands of pointless collectives,
+        # and a crash under ZeRO-2/LoRA, where parameters are still on CPU here
+        # ("No backend type associated with device type cpu"). Every rank loads
+        # the same checkpoint, and DeepSpeed broadcasts rank 0's weights --
+        # freshly initialised heads included -- when it builds the engine.
+        adapter_params = [(n, p) for n, p in model.named_parameters() if "vision_adapter" in n]
+        for name, param in adapter_params:
             with deepspeed.zero.GatheredParameters(param, modifier_rank=modifier_rank):
                 if dist.get_rank() == modifier_rank:
-                    # 仅在 modifier_rank 进程上修改参数
                     if 'vision_adapter_linear_up' in name:
                         torch.nn.init.zeros_(param)
-                    elif 'vision_adapter' in name:
+                    else:
                         torch.nn.init.kaiming_normal_(param)
-            # 同步参数到其他进程
-            dist.broadcast(param, src=modifier_rank)
+            if dist.is_available() and dist.is_initialized():
+                buf = param.data.to(torch.cuda.current_device())
+                dist.broadcast(buf, src=modifier_rank)
+                param.data.copy_(buf)
 
         total_params = sum(p.ds_numel if hasattr(p, "ds_numel") else p.numel() for p in model.parameters())
         trainable_params = sum(p.ds_numel if hasattr(p, "ds_numel") else p.numel() for p in model.parameters() if p.requires_grad)

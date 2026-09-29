@@ -233,9 +233,13 @@ class VideoProcessor:
         if do_normalize:
             world_coords = torch.maximum(world_coords, self.pc_min[scene_id].to(world_coords.device))
             world_coords = torch.minimum(world_coords, self.pc_max[scene_id].to(world_coords.device))
-        
+
+        # Metric depth doubles as the validity mask: ScanNet stores 0 where the
+        # sensor returned nothing, and unproject() maps those pixels onto the
+        # camera centre, so any geometry loss must know which points are real.
         return {
             "world_coords": world_coords,
+            "cam_depth": depths.float() / 1000.0,   # (V, H, W) in metres
         }
 
     def get_3d_features(self, video_id, model_id='flare'):
@@ -291,6 +295,7 @@ class VideoProcessor:
             do_normalize=('norm' in self.frame_sampling_strategy),
         )
         world_coords = video_dict["world_coords"]
+        cam_depth = video_dict["cam_depth"]
         V, H, W, _ = world_coords.shape
         feature_3d = None
         if video_id in self.feature_3d:
@@ -322,11 +327,13 @@ class VideoProcessor:
         if strategy == "resize":
             images = [frame.resize((crop_size, crop_size)) for frame in images]
             resized_coords = [cv2.resize(coords.numpy(), (384, 384), interpolation=cv2.INTER_NEAREST) for coords in world_coords] 
+            resized_depth = [cv2.resize(d.numpy(), (384, 384), interpolation=cv2.INTER_NEAREST) for d in cam_depth]
         elif strategy == "center_crop":
             new_height = crop_size
             new_width = int(W * (crop_size / H))
             images = [frame.resize((new_width, new_height)) for frame in images]
             resized_coords = [cv2.resize(coords.numpy(), (new_width, new_height), interpolation=cv2.INTER_NEAREST) for coords in world_coords]
+            resized_depth = [cv2.resize(d.numpy(), (new_width, new_height), interpolation=cv2.INTER_NEAREST) for d in cam_depth]
             # Calculate the position and perform the center crop
             left = (new_width - crop_size) // 2
             right = left + crop_size
@@ -335,6 +342,7 @@ class VideoProcessor:
             images = [frame.crop((left, top, right, bottom)) for frame in images]
 
             resized_coords = [coords[top:bottom, left:right, :] for coords in resized_coords]
+            resized_depth = [d[top:bottom, left:right] for d in resized_depth]
         
         # resized_coords_norm = []
         # for coords in resized_coords:
@@ -348,6 +356,9 @@ class VideoProcessor:
         return {
             "images": images,
             "world_coords": torch.from_numpy(np.stack(resized_coords)),
+            # fp16 halves the ~19MB/sample this adds to the batch; the geometry
+            # losses cast back to fp32 before doing anything numeric with it.
+            "cam_depth": torch.from_numpy(np.stack(resized_depth)).half(),
             "video_size": len(images),
             "boundry": boundry,
             "objects": torch.tensor(self.scan2obj[video_id]),
@@ -392,7 +403,7 @@ def merge_video_dict(video_dict_list):
     new_video_dict = {}
     new_video_dict['box_input'] = []
     for k in video_dict_list[0]:
-        if k in ["world_coords", 'images', 'objects', 'feature_3d']:
+        if k in ["world_coords", 'cam_depth', 'images', 'objects', 'feature_3d']:
             new_video_dict[k] = torch.stack([video_dict[k] for video_dict in video_dict_list])
         elif k in ['box_input']:
             for video_dict in video_dict_list:

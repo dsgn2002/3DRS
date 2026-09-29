@@ -444,6 +444,12 @@ class LlavaMetaForCausalLM(ABC):
         use_mrope_position_embedding = False
         use_sin3d_pe = False
         use_mlp_pe = False
+        # Only assigned when a world-position-embedding type is configured, but
+        # read unconditionally at encode_images() below. A stock LLaVA-Video
+        # config has no such attribute, so without this the model cannot run at
+        # all outside 3DRS's own training recipe. None means "plain RGB vision
+        # tower", which is what encode_images already defaults to.
+        world_coords_patch14_discrete = None
         if hasattr(self.config, 'world_position_embedding_type') and past_key_values is None:
             B = input_ids.shape[0]
             world_coords = video_dict['world_coords']
